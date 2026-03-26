@@ -1,33 +1,27 @@
 '''
 Author: @Jakob Faust
-Date: 23.10.2025
+Date: 26.03.2026
 
 Optical Flow class that abstracts
-    1) Opencv Farneback Optical Flow (https://docs.opencv.org/3.4/d4/dee/tutorial_optical_flow.html) with cuda support
-    2) Pytorch Optical Flow based on the RAFT (https://docs.pytorch.org/vision/0.12/auto_examples/plot_optical_flow.html) model
+    1) GPU: OpenCV Farneback Optical Flow (https://docs.opencv.org/3.4/d4/dee/tutorial_optical_flow.html) with cuda support
+    2) CPU: OpenCV DIS Optical flow (https://doi.org/10.48550/arXiv.1603.03590, https://docs.opencv.org/3.4/da/d06/classcv_1_1optflow_1_1DISOpticalFlow.html)
 
-Both implementations share the same BaseOF interface to allow seamless switching between Farneback and Pytorch based approaches.
+Both implementations share the same BaseOF interface to allow seamless switching between GPU Farneback and CPU DIS based approaches.
 The interface also provides an easy way for integrating other optical flow algorithms into the package. 
-Both implementations are optimized to run on a Nvidia GPU with cuda support with optimized host-device data transfer:
-We have two seperate GPU streams communicating via events.
 
+The Farneback implementation is optimized to run on a Nvidia GPU with cuda support concentrating on efficient host-device data transfer:
+We have two seperate GPU streams communicating via events.
 The first stream handles copying to and from GPU storage, the second stream performs actual GPU calculations.
 This results in asynchronous and highly performant Optical Flow Calculations. 
 
+The DIS implementation concentrates on vectorizing operations on CPUs. 
 '''
 
 import numpy as np
 from abc import ABC, abstractmethod
 from tqdm import tqdm
 from pathlib import Path
-import os
 
-import torch
-import torch.nn.functional as F
-
-import pandas as pd
-
-import time
 
 import cv2
 
@@ -336,7 +330,6 @@ class DISFlowOF:
     
     def set_masks(self, masks: list[np.ndarray]):
         for i, m in enumerate(masks):
-            # Transpose fix
             if m.shape != (self.height, self.width):
                 m = m.T
             if m.shape != (self.height, self.width):
@@ -344,7 +337,6 @@ class DISFlowOF:
             masks[i] = m
             
         self.masks = [m.astype(np.float32) for m in masks]
-        # Avoid division by zero
         self.px_per_mask = np.array([max(m.sum(), 1.0) for m in masks], dtype=np.float32)
         print(f"{len(self.masks)} Masks set for DIS processing")
 
@@ -392,10 +384,7 @@ class DISFlowOF:
         diffs_out = np.empty((max_frames, len(self.masks)), dtype=np.float32)
 
         masks_matrix = np.array(self.masks).reshape(len(self.masks), -1)
-        # px_counts = self.px_per_mask.reshape(-1, 1)
         px_counts = self.px_per_mask
-
-        mags_list, angs_list, diffs_list = [], [], []
 
         ret, frame = self.cap.read()
         if not ret: return {}
@@ -406,7 +395,6 @@ class DISFlowOF:
         flow_grids = np.zeros((max_frames, h_downsampled, w_downsampled, 2), dtype=np.float32)
         self.flow = np.empty((self.height, self.width, 2), dtype=np.float32)
         frame_idx = 0
-        # clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
         
         while True:
             ret, frame = self.cap.read()
@@ -415,51 +403,27 @@ class DISFlowOF:
             
             self.cur_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # self.prev_gray = clahe.apply(self.prev_gray)
-            # self.cur_gray = clahe.apply(self.cur_gray)
-
             self.flow = self.dis.calc(self.prev_gray, self.cur_gray, self.flow)
 
             flow = self.flow.reshape(-1, 2)
             flow_u = flow[:, 0]
             flow_v = flow[:, 1]
-
-            # flow_x = self.flow[..., 0]
-            # flow_y = self.flow[..., 1]
-
             mean_x = (masks_matrix @ flow_u) / px_counts
             mean_y = (masks_matrix @ flow_v) / px_counts
-
-            # mag = np.sqrt(mean_x**2 + mean_y**2)
-            # ang = np.arctan2(mean_y, mean_x)
 
             mags_out[frame_idx] = np.sqrt(mean_x**2 + mean_y**2)
             angs_out[frame_idx] = np.arctan2(mean_y, mean_x)
 
 
             diff = cv2.absdiff(self.cur_gray, self.prev_gray).astype(np.float32)
-            # mean_diff = (masks_matrix @ diff.reshape(-1)) / px_counts
             diffs_out[frame_idx] = (masks_matrix @ diff.reshape(-1)) / px_counts
 
-            # mags_list.append(mag)
-            # angs_list.append(ang)
-            # diffs_list.append(mean_diff)
-
             if self.save_vectors:
-                # ds = self.downsample_factor
-                # h, w, c = self.flow.shape
-                # h_new, w_new = h // ds, w // ds
-                # trimmed_flow = self.flow[:h_new * ds, :w_new * ds, :]
-                
-                # Reshape and mean to perform Average Pooling
-                # flow_grids[frame_idx] = trimmed_flow.reshape(h_new, ds, w_new, ds, c).mean(axis=(1, 3))
-
                 flow_grids[frame_idx] = cv2.resize(
                     self.flow, 
                     (w_downsampled, h_downsampled), 
                     interpolation=cv2.INTER_AREA
                 )
-                # flow_grids[frame_idx] = self.flow[::ds, ::ds, :]
 
             self.prev_gray = self.cur_gray
             pbar.update(1)
@@ -468,12 +432,6 @@ class DISFlowOF:
         self.cap.release()
         pbar.close()
 
-        # return dict(
-        #     diff=np.array(diffs_list, dtype=np.float32),
-        #     mag=np.array(mags_list, dtype=np.float32),
-        #     ang=np.array(angs_list, dtype=np.float32),
-        #     flow_grid=flow_grids.transpose(0, 3, 1, 2)
-        # )
     
         return dict(
             diff=diffs_out[:frame_idx],
